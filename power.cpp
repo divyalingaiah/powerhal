@@ -31,6 +31,7 @@
 #include <cutils/log.h>
 #include <cutils/properties.h>
 #include <hardware/hardware.h>
+#include <semaphore.h>
 #include "CGroupCpusetController.h"
 #include "DevicePowerMonitor.h"
 
@@ -45,6 +46,12 @@ static const char cpufreq_boost_intel_pstate[] = "/sys/devices/system/cpu/intel_
  * considered as a scroll event.
  */
 #define SHORT_TOUCH_TIME 20
+#define SCHEDTUNE_BOOST_PATH "/dev/stune/foreground/schedtune.boost"
+#define SCHEDTUNE_BOOST_NORM "10"
+#define SCHEDTUNE_BOOST_INTERACTIVE "40"
+#define SCHEDTUNE_BOOST_TIME_NS 1000000000LL
+#define container_of(addr, struct_name, field_name) \
+    ((struct_name *)((char *)(addr) - offsetof(struct_name, field_name)))
 
 /*
  * This parameter is to identify first touch events.
@@ -70,12 +77,17 @@ static DevicePowerMonitor powerMonitor;
 static bool serviceRegistered = false;
 static bool interactiveActive = false;
 static bool intelPStateActive = false;
+static bool intelSchedBoostActive = false;
 
 struct intel_power_module{
     struct power_module container;
     int touchboost_disable;
     int timer_set;
     int vsync_boost;
+    pthread_mutex_t lock;
+    int schedtune_boost_fd;
+    long long deboost_time;
+    sem_t signal_lock;
 };
 
 static int sysfs_write(const char *path, char *s)
@@ -162,10 +174,96 @@ static void app_launch_boost_intel_pstate(void *hint_data)
 
 #endif
 
+#define NSEC_PER_SEC 1000000000LL
+static long long gettime_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
+}
+
+static void nanosleep_ns(long long ns)
+{
+    struct timespec ts;
+    ts.tv_sec = ns/NSEC_PER_SEC;
+    ts.tv_nsec = ns%NSEC_PER_SEC;
+    nanosleep(&ts, NULL);
+}
+
+int schedtune_sysfs_boost(struct intel_power_module *intel, char* booststr)
+{
+    char buf[80];
+    int len;
+    len = write(intel->schedtune_boost_fd, booststr, 2);
+
+    if (len < 0) {
+        strerror_r(errno, buf, sizeof(buf));
+        ALOGE("Error writing to %s: %s\n", SCHEDTUNE_BOOST_PATH, buf);
+    }
+    return len;
+}
+
+static void* schedtune_deboost_thread(void* arg)
+{
+    struct intel_power_module *intel = (struct intel_power_module *)arg;
+    while(1) {
+        sem_wait(&intel->signal_lock);
+        while(1) {
+            long long now, sleeptime = 0;
+            pthread_mutex_lock(&intel->lock);
+            now = gettime_ns();
+            if (intel->deboost_time > now) {
+                sleeptime = intel->deboost_time - now;
+                pthread_mutex_unlock(&intel->lock);
+                nanosleep_ns(sleeptime);
+		continue;
+            }
+
+            schedtune_sysfs_boost(intel,(char*)SCHEDTUNE_BOOST_NORM);
+            intel->deboost_time = 0;
+            pthread_mutex_unlock(&intel->lock);
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void schedtune_boost(struct intel_power_module *intel)
+{
+    long long now;
+    now = gettime_ns();
+
+    if (!intel->deboost_time) {
+        schedtune_sysfs_boost(intel,(char*)SCHEDTUNE_BOOST_INTERACTIVE);
+        sem_post(&intel->signal_lock);
+    }
+    intel->deboost_time = now + SCHEDTUNE_BOOST_TIME_NS;
+    return;
+}
+
+static int schedtune_power_init(struct intel_power_module *intel)
+{
+    char buf[50];
+    pthread_t tid;
+    intel->deboost_time = 0;
+    sem_init(&intel->signal_lock, 0, 1);
+    intel->schedtune_boost_fd = open(SCHEDTUNE_BOOST_PATH, O_WRONLY);
+
+    if (intel->schedtune_boost_fd < 0) {
+        strerror_r(errno, buf, sizeof(buf));
+        ALOGE("Error opening %s: %s\n", SCHEDTUNE_BOOST_PATH, buf);
+        sem_close(&intel->signal_lock);
+        return -1;
+    }
+    pthread_create(&tid, NULL, schedtune_deboost_thread, intel);
+    return 0;
+}
+
 static void power_init(__attribute__((unused))struct power_module *module)
 {
     int cnt = 0;
     char buf[1];
+    struct intel_power_module *intel = container_of(module,struct intel_power_module, container);
 
     /* Enable all devices by default */
     powerMonitor.setState(ENABLE);
@@ -175,6 +273,8 @@ static void power_init(__attribute__((unused))struct power_module *module)
         interactiveActive = true;
     if (!sysfs_read(cpufreq_boost_intel_pstate, buf, 1))
 	intelPStateActive = true;
+    if (!schedtune_power_init(intel))
+	intelSchedBoostActive = true;
 }
 
 static void power_set_interactive(__attribute__((unused))struct power_module *module, int on)
@@ -192,10 +292,18 @@ static void power_hint(struct power_module *module, power_hint_t hint,
     static int vsync_count;
     static int consecutive_touch_int;
 
+    pthread_mutex_lock(&intel->lock);
     switch(hint) {
     case POWER_HINT_INTERACTION:
-        if (!interactiveActive)
-            return;
+        if (!interactiveActive) {
+            if (!intelSchedBoostActive) {
+                break;
+          } else {
+                schedtune_boost(intel);
+                break;
+            }
+        }
+
         clock_gettime(CLOCK_MONOTONIC, &curr_time);
         diff = (curr_time.tv_sec - prev_time.tv_sec) * 1000 +
                (double)(curr_time.tv_nsec - prev_time.tv_nsec) / 1e6;
@@ -227,8 +335,10 @@ static void power_hint(struct power_module *module, power_hint_t hint,
         }
         break;
     case POWER_HINT_VSYNC:
-        if (!interactiveActive)
+        if (!interactiveActive) {
+            pthread_mutex_unlock(&intel->lock);
             return;
+        }
         if (intel->touchboost_disable == 1) {
             clock_gettime(CLOCK_MONOTONIC, &vsync_time);
             diff = (vsync_time.tv_sec - curr_time.tv_sec) * 1000 +
@@ -262,6 +372,7 @@ static void power_hint(struct power_module *module, power_hint_t hint,
     default:
         break;
     }
+    pthread_mutex_unlock(&intel->lock);
 }
 
 static struct hw_module_methods_t power_module_methods = {
